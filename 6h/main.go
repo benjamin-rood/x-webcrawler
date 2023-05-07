@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -50,22 +51,24 @@ var (
 	// these could easily be initialised in main, but I am in a rush
 	// As each HTML page is parsed for links, valid child links get added to buffered channel "queue"
 	// this also works to cap the amount of spawned `childLinkExtractor` instances
-	CrawlQueue = make(chan string, 20)
+	CrawlQueue = make(chan string, 50)
 	// unbuffered channel as blocking queue to enforce single writes to disk
 	WriteFile = make(chan htmlFile)
 	// laziest concurrent-safe solution to keeping track of what has been visited,
-	// can't be bothered implementing a regular map controlled by a mutex
 	Discovered sync.Map
 	// very simple error values to handle expected cases
 	HTTPNotFound       = errors.New("page not found")
 	HTTPContentNotHTML = errors.New("page content not HTML")
 	URLNotChildLink    = errors.New("url can't be resolved as a child link")
+	// errors are just values
+	Finished = errors.New("finished")
 )
 
-func parseFlagsAndSetup() {
+func parseFlagsAndSetup() error {
+	var err error
 	// make sure we are not running on Windows!
 	if runtime.GOOS == "windows" {
-		log.Fatal("crawler is not Windows-compatible")
+		return fmt.Errorf("crawler is not Windows-compatible")
 	}
 
 	// Define the command-line flags
@@ -76,26 +79,26 @@ func parseFlagsAndSetup() {
 	flag.Parse()
 	// Check if the searchUrl flag is set
 	if *searchUrlArg == "" {
-		log.Fatal("usage: crawler -searchUrl x -outputDir y")
+		return fmt.Errorf("usage: crawler -searchUrl x -outputDir y")
 	}
 	// Check if the outputDir flag is set
 	if *outputDirArg == "" {
-		log.Fatal("usage: crawler -searchUrl x -outputDir y")
+		return fmt.Errorf("usage: crawler -searchUrl x -outputDir y")
 	}
 
 	// proceed with setup
 	// we will convert the given `searchUrl` into a URL type to make everything easier down the line
-	RootURL, err := url.Parse(*searchUrlArg)
+	RootURL, err = url.Parse(*searchUrlArg)
 	if err != nil {
-		log.Fatalf("searchUrl arg '%s' cannot be parsed into a proper URL: %s", *searchUrlArg, err)
+		return fmt.Errorf("searchUrl arg '%s' cannot be parsed into a proper URL: %s", *searchUrlArg, err)
 	}
 	if RootURL.Scheme != "http" && RootURL.Scheme != "https" {
-		log.Fatalf("searchUrl arg '%s' is not an http or https URL", *searchUrlArg)
+		return fmt.Errorf("searchUrl arg '%s' is not an http or https URL", *searchUrlArg)
 	}
 	// check if the outputDir already exists to see if we need to resume prior searching
 	absDirPath, err := filepath.Abs(*outputDirArg)
 	if err != nil {
-		log.Fatalf("outputDir arg '%s' could not be resolved", *outputDirArg)
+		return fmt.Errorf("outputDir arg '%s' could not be resolved", *outputDirArg)
 	}
 	dirEntries, readDirErr := os.ReadDir(absDirPath)
 	if readDirErr == nil {
@@ -115,23 +118,33 @@ func parseFlagsAndSetup() {
 	} else if os.IsNotExist(readDirErr) {
 		// create the directory
 		if err := os.MkdirAll(absDirPath, 0755); err != nil {
-			log.Fatalf("could not create specified output directory '%s'", absDirPath)
+			return fmt.Errorf("could not create specified output directory '%s'", absDirPath)
 		}
 	} else {
 		// ack! we've got an serious error, abort abort
-		log.Fatal(readDirErr)
+		return readDirErr
 	}
 	OutputDir = absDirPath
 	// setup completed!
+	return nil
 }
 
 func main() {
 	// initialise, set up HTML fetchers and HTML link-finders
 	// can be closed with cancel signal or timeout
-	// set up our async servers, error handling, and gracefull shutdown
+	// set up our async servers, error handling, and graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	eg, egCtx := errgroup.WithContext(ctx)
+
+	// start a go function to stop all goroutines in the error group when
+	// the error group context is done
+	go func() {
+		// wait on the context to complete
+		<-egCtx.Done()
+		// cancel any others running
+		cancel()
+	}()
 
 	// setup signal handling to cancel everything if we receive a signal (e.g. Ctrl-C)
 	go func() {
@@ -143,24 +156,71 @@ func main() {
 		log.Print("exiting on signal...", sig)
 		// cancel all running
 		cancel()
+		os.Exit(1)
 	}()
 
-	parseFlagsAndSetup() // will call os.Exit(1) if setup fails
+	// start writer inside error group
+	w := func() error { return writer(egCtx) }
+	eg.Go(w)
 
-	spawnCrawlers(eg, egCtx)
+	var inactivityCount atomic.Uint32
+	inactivityCount.Store(0)
+	// spawn 5 crawlers in error group
+	spawnCrawlers(eg, egCtx, &inactivityCount)
+
+	if err := parseFlagsAndSetup(); err != nil {
+		// ABORT ON ANY ERRORS
+		cancel()
+		log.Fatal(err)
+	}
+
+	// simplistic completion detection, in lieu of some better algorithmic way
+	// flawed because this approach doesn't detect if there is a deadlock somewhere
+	inactivity := time.NewTicker(50 * time.Millisecond)
+	eg.Go(func() error {
+		for {
+			select {
+			// check for no waiting work every 100ms
+			case <-inactivity.C:
+				// if both channels are empty for 1s or more, exit
+				if len(CrawlQueue) == 0 && len(WriteFile) == 0 {
+					inactivityCount.Add(1)
+					if inactivityCount.Load() >= 10 {
+						// assume crawling complete
+						log.Println("finishing")
+						return Finished
+					}
+				}
+			case <-egCtx.Done():
+				return egCtx.Err()
+			}
+		}
+	})
+	// begin timer
+	start := time.Now()
 	// seed the crawling with the starting url
+	if RootURL == nil {
+		log.Fatal("RootURL nil")
+	}
 	CrawlQueue <- RootURL.String()
+
 	// wait for the errorgroup to finish
 	if err := eg.Wait(); err != nil {
-		// this might not be all the errors, but will be the first received
-		log.Println(err)
+		// finished natually, or due to a fault?
+		if !errors.Is(err, Finished) {
+			// this might not be all the errors, but will be the first received
+			log.Fatal(err)
+		}
+		log.Println(err.Error())
+		cancel()
+		log.Printf("time elapsed = %v seconds\n", time.Now().Sub(start).Seconds())
+		return
 	}
 }
 
-func spawnCrawlers(group *errgroup.Group, errCtx context.Context) {
-	timeout := time.NewTicker(time.Second)
+func spawnCrawlers(group *errgroup.Group, groupCtx context.Context, counter *atomic.Uint32) {
 	// Spawn 5 worker goroutines in the given error group
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 32; i++ {
 		// TODO: make use of workerID in the logging for each crawler
 		// workerID := i
 		group.Go(func() error {
@@ -170,24 +230,20 @@ func spawnCrawlers(group *errgroup.Group, errCtx context.Context) {
 					if !ok {
 						return nil // CrawlQueue closed, exit
 					}
+					// reset no activity counter
+					counter.Swap(0)
 					h, err := fetchHTML(url)
 					if err != nil {
 						// log it, no point in crashing the program
 						log.Println("couldn't fetch html doc at", url)
 						continue // skip doing anything else with this
 					}
-					// spawn a goroutine to extract child links, will add links to the CrawlQueue
-					go childLinkExtractor(h)
-					WriteFile <- htmlFile{h, url} // blocks until file has been picked up to be written
+					// extract child links, will add links to the CrawlQueue
+					go childLinkExtractor(url, h)
+					WriteFile <- htmlFile{url, h} // blocks until file has been picked up to be written
 
-				// VERY VERY VERY LAZY & FLAWED APPROACH!
-				case <-timeout.C:
-					if len(CrawlQueue) == 0 && len(WriteFile) == 0 {
-						return nil
-					}
-
-				case <-errCtx.Done():
-					return errCtx.Err()
+				case <-groupCtx.Done():
+					return groupCtx.Err()
 				}
 			}
 		})
@@ -195,8 +251,8 @@ func spawnCrawlers(group *errgroup.Group, errCtx context.Context) {
 }
 
 type htmlFile struct {
-	HtmlDoc string
 	Url     string
+	HtmlDoc string
 }
 
 func writer(ctx context.Context) error {
@@ -208,7 +264,7 @@ func writer(ctx context.Context) error {
 			}
 			// TODO: add checks to make sure `hf` is in a valid state, e.g. if empty
 			escapedUrl := url.PathEscape(hf.Url) // use the url (escaped) as the filename
-			writePath := filepath.Join(OutputDir, escapedUrl+".html")
+			writePath := filepath.Join(OutputDir, escapedUrl)
 			if err := os.WriteFile(writePath, []byte(hf.HtmlDoc), 0644); err != nil {
 				return fmt.Errorf("Failed to write file %s: %v", writePath, err)
 			}
@@ -220,6 +276,7 @@ func writer(ctx context.Context) error {
 
 // fetcher to get HTML doc from a given url
 func fetchHTML(url string) (string, error) {
+	log.Printf("fetching HTML from url <%s>", url)
 	resp, err := http.Get(url)
 	if err != nil {
 		return "", err
@@ -243,7 +300,11 @@ func fetchHTML(url string) (string, error) {
 
 // given the contents of an html document, will parse and extract all valid urls inside <a> tags in a page
 // where a valid url is one that resolves to being a "child" of the parent URL
-func childLinkExtractor(parentHTML string) {
+func childLinkExtractor(parentLink, parentHTML string) {
+	parentURL, err := url.Parse(parentLink)
+	if err != nil {
+		log.Fatal(err)
+	}
 	// parsing for links stolen from: https://pkg.go.dev/golang.org/x/net/html#example-Parse
 	doc, err := html.Parse(strings.NewReader(parentHTML))
 	if err != nil {
@@ -256,21 +317,18 @@ func childLinkExtractor(parentHTML string) {
 		if n.Type == html.ElementNode && n.Data == "a" {
 			for _, attr := range n.Attr {
 				if attr.Key == "href" {
-					link, err := RootURL.Parse(attr.Val)
+					link, err := parentURL.Parse(attr.Val)
 					if err != nil {
 						continue // something malformed, just skip
 					}
 					// only want HTTP links, that resolve to a child of the given parentURL, and that we haven't visited before
 					if link.Scheme == "http" || link.Scheme == "https" {
-						if link.IsAbs() {
-							if link.Host == RootURL.Host && strings.HasPrefix(link.Path, RootURL.Path) {
-								childLink = link.String()
-							}
-						} else {
-							resolved := RootURL.ResolveReference(link)
-							if resolved.Host == RootURL.Host && strings.HasPrefix(resolved.Path, RootURL.Path) {
-								childLink = resolved.String()
-							}
+						if !link.IsAbs() {
+							link = RootURL.ResolveReference(link)
+						}
+						if strings.HasPrefix(basePath(link.String()), basePath(RootURL.String())) {
+							// strip any in-page anchor from link url
+							childLink = strings.Split(link.String(), "#")[0]
 						}
 						if childLink != "" {
 							_, alreadyDiscovered := Discovered.LoadOrStore(childLink, false)
@@ -297,12 +355,147 @@ func childLinkExtractor(parentHTML string) {
 	traverseForLinks(doc)
 }
 
-func appendUnique[T comparable](slice []T, elem T) []T {
-	for _, x := range slice {
-		if x == elem {
-			return slice // Element already exists, return original slice
+func basePath(link string) string {
+	pathParts := strings.Split(link, "/")
+	return strings.TrimRight(link, pathParts[len(pathParts)-1])
+}
+
+type subtree struct {
+	node  *html.Node
+	depth int
+}
+
+func traverseForLinksParallel(ctx context.Context, root *html.Node) {
+	// Create a buffered channel to store subtrees that need to be processed.
+	subtreeQueue := make(chan subtree, 10)
+	finish := make(chan struct{})
+
+	// Create a wait group to wait for all workers to finish.
+	var wg sync.WaitGroup
+
+	// Add the root node to the work queue.
+	subtreeQueue <- subtree{root, 0}
+
+	// Start work
+	wg.Add(1)
+	func() {
+		defer wg.Done()
+		// primary worker
+		go func() {
+			for len(subtreeQueue) > 0 {
+				select {
+				case <-ctx.Done():
+					return
+
+				default:
+					st, ok := <-subtreeQueue
+					if ok {
+						processSubtree(ctx, st, subtreeQueue)
+					}
+				}
+			}
+			// queue empty, signal other workers to stop
+			close(finish)
+			return
+		}()
+		// work stealers
+		for {
+			select {
+			case <-ctx.Done():
+				return
+
+			case <-finish:
+				return
+
+			default:
+				st, ok := stealWork(subtreeQueue)
+				if ok {
+					if len(CrawlQueue) < 20 {
+						wg.Add(1)
+						go func() {
+							defer wg.Done()
+							processSubtree(ctx, st, subtreeQueue)
+						}()
+					} else {
+						// put the stolen work back on the work queue
+						subtreeQueue <- st
+					}
+				}
+			}
+		}
+	}()
+
+	// Wait for all workers to finish.
+	wg.Wait()
+}
+
+func processSubtree(ctx context.Context, st subtree, subtreeQueue chan<- subtree) {
+	node := st.node
+	depth := st.depth
+
+	if node == nil {
+		// The subtree has been processed. Return.
+		return
+	}
+
+	// extractChildLink will add any child urls not previously discovered
+	// to the CrawlQueue channel
+	// parsing of the node for a suitable link can be done in parallel
+	go extractChildLink(node)
+
+	// breadth-first traversal of the HTML node tree
+	// TODO: implement depth restriction
+	for c := node.FirstChild; c != nil; c = c.NextSibling {
+		select {
+		case <-ctx.Done():
+			// Context cancelled. Stop processing subtrees.
+			return
+		default:
+			// Context not cancelled. Add subtree to the queue.
+			subtreeQueue <- subtree{c, depth + 1}
 		}
 	}
-	// Element does not exist, return appended result
-	return append(slice, elem)
+}
+
+func extractChildLink(n *html.Node) {
+	childLink := ""
+	if n.Type == html.ElementNode && n.Data == "a" {
+		for _, attr := range n.Attr {
+			if attr.Key == "href" {
+				link, err := RootURL.Parse(attr.Val)
+				if err != nil {
+					continue // something malformed, just skip
+				}
+				// only want HTTP links, that resolve to a child of the given parentURL, and that we haven't visited before
+				if link.Scheme == "http" || link.Scheme == "https" {
+					if !link.IsAbs() {
+						link = RootURL.ResolveReference(link)
+					}
+					if strings.HasPrefix(basePath(link.String()), basePath(RootURL.String())) {
+						// strip any in-page anchor from link url
+						childLink = strings.Split(link.String(), "#")[0]
+					}
+					if childLink != "" {
+						_, alreadyDiscovered := Discovered.LoadOrStore(childLink, false)
+						if !alreadyDiscovered {
+							// add to the queue of urls to visit
+							// will block if queue is full
+							CrawlQueue <- childLink
+						}
+					}
+				}
+				break
+			}
+		}
+	}
+}
+
+func stealWork(subtreeQueue <-chan subtree) (subtree, bool) {
+	select {
+	case st := <-subtreeQueue:
+		return st, true
+	default:
+		// No work available to steal.
+		return subtree{}, false
+	}
 }
